@@ -196,7 +196,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         warp_role = WarpRole::STORE;
     }
 
-#ifndef TMA_DISABLE_ALL
+#ifndef TMA_DISABLE_ALL // Producer-Consumer pipelining
     using LoadPipelineState = cutlass::PipelineState<InputStages>;
     using LoadPipeline = cutlass::PipelineTmaAsync<InputStages>;
     LoadPipeline load_pipeline = make_load_pipeline<InputStages>(
@@ -211,13 +211,53 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         warp_role, kComputeThreads, 1
     );
 #endif
+    /*
+      Visual:
+                   seq0        seq1        seq2
+      head0     CTA(0,0)    CTA(1,0)    CTA(2,0)
+      head1     CTA(0,1)    CTA(1,1)    CTA(2,1)
+      head2     CTA(0,2)    CTA(1,2)    CTA(2,2)
+      head3     CTA(0,3)    CTA(1,3)    CTA(2,3)
 
+      So this CTA:
+      blockIdx.x = 1
+      blockIdx.y = 2
+
+      means:
+      process sequence 1, head 2
+    */
     // --- per-block sequence info
     int seq_idx  = blockIdx.x;
     int head_idx = blockIdx.y;
     int64_t bos, eos;
     int tile_base;
 
+    /*
+       So inside the Kernel-2 CTA for seq_idx = 2:
+          local t=0 needs Kernel 1 global tile 4
+          local t=1 needs Kernel 1 global tile 5
+          local t=2 needs Kernel 1 global tile 6
+          local t=3 needs Kernel 1 global tile 7
+
+          That is why we need:
+          global_tile_idx = tile_base + t;
+
+          For seq_idx = 2:
+          tile_base = number of chunks before seq2
+                    = seq0 chunks + seq1 chunks
+                    = 3 + 1
+                    = 4
+
+          Then:
+          t=0 -> tile_base + t = 4
+          t=1 -> tile_base + t = 5
+          t=2 -> tile_base + t = 6
+          t=3 -> tile_base + t = 7
+
+       t: is local chunk number in this seq
+       tile_base: how many chunks before this seq
+       tile_base + t: mapping to global_tile_idx from Kernel-1
+    */
     if constexpr (IsVarlen) {
         bos = cu_seqlens[seq_idx];
         eos = cu_seqlens[seq_idx + 1];
@@ -234,7 +274,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     }
     int seq_len  = int(eos - bos);
     int t_tiles  = (seq_len + CHUNK - 1) / CHUNK;
-    bool lane_predicate = cute::elect_one_sync();
+    bool lane_predicate = cute::elect_one_sync(); // one lane for issuing the TMA copy instruction
 
     // --- Load initial state
 #ifndef TMA_DISABLE_ALL
@@ -302,6 +342,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         __syncthreads();
     } else {
         // No state in: zero-initialize state_acc
+        // kTotal is 128*128 = 16384 bf16 values & NumThreads = 192, every thread is strided with 192 like :
+        //   thread 0 writes i = 0, 192, 384, ...
+        //   thread 1 writes i = 1, 193, 385, ...
         {
             BF16* buf = shared_storage.state_acc.begin();
             constexpr int kTotal = cute::cosize_v<StateSmemLayout>;
@@ -329,7 +372,11 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         auto g_ws_inv = tma_load_ws_inv.get_tma_tensor(make_shape(H * total_tiles, CHUNK, CHUNK));
         auto g_ws_mqk = tma_load_ws_mqk.get_tma_tensor(make_shape(H * total_tiles, CHUNK, CHUNK));
 
+        // init load pipeline producer with kInputStages=3, of load warp cycles.
+        // the idea is to let the LOAD warp a small state object that tracks which shared-memory input stage, it should fill next.
         LoadPipelineState load_write = cutlass::make_producer_start_state<LoadPipeline>();
+        // each tma_load_ object is a TMA descriptor with things like source & destination mem layout, copy op (TMA load).
+        // get_slice(Int<0>{}) asks for a CTA copy helper for slice 0.
         auto cta_tma_load_v = tma_load_v.get_slice(Int<0>{});
         auto cta_tma_load_beta = tma_load_beta.get_slice(Int<0>{});
         auto cta_ws_kd = tma_load_ws_kd.get_slice(Int<0>{});
@@ -339,11 +386,11 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         auto cta_ws_inv = tma_load_ws_inv.get_slice(Int<0>{});
         auto cta_ws_mqk = tma_load_ws_mqk.get_slice(Int<0>{});
 
-        for (int t = 0; t < t_tiles; ++t) {
-            load_pipeline.producer_acquire(load_write);
-            using LoadBarrierType = typename LoadPipeline::ProducerBarrierType;
+        for (int t = 0; t < t_tiles; ++t) { // local chunk index inside this sequence.
+            load_pipeline.producer_acquire(load_write); // wait until the current input stage is free to write.
+            using LoadBarrierType = typename LoadPipeline::ProducerBarrierType; // async barrier for the current stage. All TMA copies for this chunk are attached to this barrier. Compute warps waits until this barrier says ready.
             LoadBarrierType* tma_barrier = load_pipeline.producer_get_barrier(load_write);
-            int stage = load_write.index();
+            int stage = load_write.index(); // selects which stage to fill
             int ws_idx = head_idx * total_tiles + tile_base + t;
 
             // TMA load v
@@ -412,25 +459,34 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 cute::copy(tma_load_ws_mqk.with(*tma_barrier), cta_ws_mqk.partition_S(g_tile), cta_ws_mqk.partition_D(s_tile));
             }
 
-            ++load_write;
+            ++load_write; // moving onto the next load producer pipeline stage.
         }
         load_pipeline.producer_tail(load_write);
     }
 #endif
 
+    /*
+      LOAD warp loaded one chunk into shared input[stage]
+      MMA warps consume that chunk
+      MMA warps write output into shared output[out_stage]
+      STORE warp later stores that output to global memory
+    */
+
     // --- MMA warps
+    // each warp works with two 16-column blocks of D=128 output/state columns
+    // warp 0 = col 0... 31 -> block 0, 1 so on
     if (warp_role == WarpRole::MMA) {
-        cutlass::arch::NamedBarrier compute_barrier(kComputeThreads, 0);
+        cutlass::arch::NamedBarrier compute_barrier(kComputeThreads, 0); // kComputeThreads = 128 = 4 warps
 #ifndef TMA_DISABLE_ALL
-        LoadPipelineState load_read;
-        StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>();
+        LoadPipelineState load_read; // load_read is the compute side handle for reading input[stage]
+        StorePipelineState out_write = cutlass::make_producer_start_state<StorePipeline>(); // out_write is the compute side handle for producing output[stage]
 #endif
         int compute_tid = threadIdx.x;
 
         for (int t = 0; t < t_tiles; ++t) {
 #ifndef TMA_DISABLE_ALL
-            store_pipeline.producer_acquire(out_write);
-            load_pipeline.consumer_wait(load_read);
+            store_pipeline.producer_acquire(out_write); // producer is the warp that stores/writes.
+            load_pipeline.consumer_wait(load_read); // consumer is the warp that loads.
             int load_stage = load_read.index();
             int out_stage = out_write.index();
 #else
@@ -465,7 +521,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>{},
                 Layout<Shape<_1,_1>>{},
                 Tile<_16,_16,_16>{}
-            );
+            ); // since the atom is 16x8x16 but the tile shape is 16, 16, 16, CuTe covers for the rest of the N=16 logical tiles by doing the atom 2 times like 16x8 - 16x8, which makes it 16x16x16.
 
             const int warp_id = compute_tid / 32;
             const int lane_id = compute_tid % 32;
@@ -497,13 +553,23 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             auto smem_tiled_store_C_T = make_tiled_copy_C(Copy_Atom<SM90_U16x8_STSM_T, BF16>{}, mma);
             auto smem_thr_store_C_T   = smem_tiled_store_C_T.get_slice(lane_id);
 
+            // so basically the idea is have reference tiles that will tell CuTe shape & layout for A, B, C and that tile is mostly 16x16 in size.
+            // the reason we're doing this is because we want to create per-lane register fragment layouts. basically, for CuTe to know, for this lane_id, what part of the 16x16 tile, it has/works on?
+            // thr_mma.partition_fragment_A does exactly that. 
             Tensor A_ref = local_tile(k_decayed, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
             Tensor B_ref = local_tile(s_acc, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
             Tensor C_ref = local_tile(v_tile, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0));
 
-            Tensor tCrAi_k = make_fragment_like<BF16>(thr_mma.partition_fragment_A(A_ref));
-            auto tCrAi_k_view = smem_thr_copy_A.retile_D(tCrAi_k);
-            auto tCrA_k = thr_mma.partition_fragment_A(A_ref);
+            /*
+             the whole flow is:
+              -> ldmatrix copy into tCrAi_k_view
+              -> data lives in tCrAi_k
+              -> transform into tCrA_k
+              -> gemm uses tCrA_k
+            */
+            Tensor tCrAi_k = make_fragment_like<BF16>(thr_mma.partition_fragment_A(A_ref)); // can be read as creating a BF16 register fragment with the same shape/layout as this lane's A operand fragment. allocates per-lane register storage.
+            auto tCrAi_k_view = smem_thr_copy_A.retile_D(tCrAi_k); // take the register fragment tCrAi_k and reinterpret it's layout as the destination layout expected by this ldmatrix copy. we need to do this because the ldmatrix instruction expects the destination registers in copy atom's destination layout. retile_D() does that.
+            auto tCrA_k = thr_mma.partition_fragment_A(A_ref); // make the actual MMA A operand fragment view used by gemm(thr_mma, tCrA_k)
 
             Tensor tCrAi_q = make_fragment_like<BF16>(thr_mma.partition_fragment_A(A_ref));
             auto tCrAi_q_view = smem_thr_copy_A.retile_D(tCrAi_q);
@@ -515,19 +581,27 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
             auto tCrC_ref = thr_mma.partition_C(C_ref);
 
-            using AccFragT = decltype(thr_mma.make_fragment_C(tCrC_ref));
-            using SFragT = decltype(make_fragment_like<BF16>(thr_mma.make_fragment_C(tCrC_ref)));
-            using AFragT = decltype(thr_mma.partition_fragment_A(A_ref));
-            using BFragT_u = decltype(thr_mma.partition_fragment_B(B_ref));
+            using AccFragT = decltype(thr_mma.make_fragment_C(tCrC_ref)); // type of accumulator fragment for this lane's C partition. float it is btw
+            using SFragT = decltype(make_fragment_like<BF16>(thr_mma.make_fragment_C(tCrC_ref))); // BF16 type ofc
+            using AFragT = decltype(thr_mma.partition_fragment_A(A_ref)); // type of an MMA A operand fragment
+            using BFragT_u = decltype(thr_mma.partition_fragment_B(B_ref)); // type of an MMA B operand fragment
 
-            AccFragT u_acc[2], out_acc[2];
+            AccFragT u_acc[2], out_acc[2]; // 2 here because each warp handles 2 16-column blocks
             #pragma unroll
-            for (int i = 0; i < 2; ++i) { u_acc[i] = thr_mma.make_fragment_C(tCrC_ref); clear(u_acc[i]); }
+            for (int i = 0; i < 2; ++i) { u_acc[i] = thr_mma.make_fragment_C(tCrC_ref); clear(u_acc[i]); } // init each float acc fragment and clears it to zero.
             #pragma unroll
             for (int i = 0; i < 2; ++i) { out_acc[i] = thr_mma.make_fragment_C(tCrC_ref); clear(out_acc[i]); }
 
             // ======== Phase 1: Dual GEMM k@s and q@s (k-loop, 2 blocks per warp) ========
-            constexpr int K_BLOCKS = decltype(cute::size<1>(k_decayed))::value / 16;
+            // so in this Copy atom 1 warp does 16x8 block twice to cover the 16x16 tile & then for all the 32 lanes of a warp, it cover the same M/CHUNK = 16 as row but 0...31 which is 16 cols two times. hope this makes sense.
+            /*
+                  Output C = [M,N] = [16,128]
+
+                           N columns / D dim
+                        0..15  16..31  32..47  48..63  64..79  80..95  96..111 112..127
+              M 0..15   warp0  warp0   warp1   warp1   warp2   warp2   warp3   warp3
+            */ 
+            constexpr int K_BLOCKS = decltype(cute::size<1>(k_decayed))::value / 16; // size<1>(k_decayed) = D = 128 (it has original shape CHUNK, D), after this /16 is computing K-reduction dimension in 8 chunks
 
             copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(
                 local_tile(k_decayed, make_shape(Int<16>{}, Int<16>{}), make_coord(0, 0))), tCrAi_k_view);
@@ -564,32 +638,40 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             }
 
             // ======== Phase 2: Cast out (keep in regs), load v/INV/beta ========
+            // so from Phase 1, we'd have filled up u_acc[2] & out_acc[2] for both 16-cols blocks owned by a warp.
             SFragT out_bf16[2];
             #pragma unroll
             for (int i = 0; i < 2; ++i)
-                cute::transform(out_acc[i], out_bf16[i], [] __device__ (float x) { return BF16(x); });
+                cute::transform(out_acc[i], out_bf16[i], [] __device__ (float x) { return BF16(x); }); // so one of the reason we didn't used cute::identity{} here like before is because transform tries to do element-wise op match, which in this case is going to be Float = BF16. the error that shows up is operand types are 'cutlass::bfloat16_t' & 'const float' are no match.
 
             SFragT v_bf16[2];
             #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 Tensor v_block = local_tile(v_tile, make_shape(Int<16>{}, Int<16>{}), make_coord(0, warp_id * 2 + i));
-                copy(smem_tiled_load_C, smem_thr_load_C.partition_S(v_block), smem_thr_load_C.retile_D(v_bf16[i]));
+                copy(smem_tiled_load_C, smem_thr_load_C.partition_S(v_block), smem_thr_load_C.retile_D(v_bf16[i])); // retile_D because destination needs to match the bf16 fragment.
             }
 
             copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(INV), tCrAi_k_view);
             cute::transform(tCrAi_k, tCrA_k, cute::identity{});
 
-            BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id))));
+            BF16 beta0 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id)))); // since group_id is 0..7 (+8), so these cover two token rows per-lane group as together both groups covers row 0..15
             BF16 beta1 = BF16(sigmoid_tanh_approx_f32(float(beta_tile(beta_smem_offset + group_id + 8))));
 
             // ======== Phase 3: u = (v - u) * beta; u = INV @ u (per block) ========
-            SFragT u_bf16[2];
+            SFragT u_bf16[2]; // for the current u fragment in BF16
             uint32_t u_b_regs[4];
 
             #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 cute::transform(u_acc[i], u_bf16[i], [] __device__ (float x) { return BF16(x); });
 
+                // make_coord does something like this for:
+                // make_coord(make_coord(a, 0), 0, d)
+                //   frag[a][0][0][d]
+                //
+                //  make_coord(make_coord(a, 1), 0, d) is like:
+                //   frag[a][1][0][d]
+                //  so basically we're indexing over [2][2][0][2] which is written in CuTe like ((2,2),0,2) which are called "modes".
                 #pragma unroll
                 for (int a = 0; a < 2; ++a) {
                     #pragma unroll
@@ -601,31 +683,40 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                     }
                 }
 
-                uint32_t* u_c = reinterpret_cast<uint32_t*>(&u_bf16[i](0));
-                SM75_U32x1_MOVM_T::copy(u_c[0], u_b_regs[0]);
+                // we are doing this because here we need to do INV @ U but from before U has been C-type fragment [M, N] but now it's in B-type fragment [N,K]
+                // so here SFragT u_bf16 has size: 8 & value_bytes: 2 meaning sfrag has 8 elements with each BF16 element being 2 bytes. it's layout is something like this: layout - ((_2,_2),_1,_2):((_1,_2),_0,_4). Now why 8 elements it's because the MMA fragment for C tile was Tile<_16,_16,_16> meaning 16x16 = 256 elements, since each warp has 32 lanes -> 256 elements / 32 lanes = 8 elements per lane.
+
+                uint32_t* u_c = reinterpret_cast<uint32_t*>(&u_bf16[i](0)); // like we discussed each lane has 8 BF16 elements ('u_bf16[i]' is the lane in question). Now each bf16 is 16-bits ofc (8 bf16 elements = 8 * 16-bits = 128-bits) & a uint32_t is 32-bits again ofc, 128 / 32 = 4 uint32_t registers of equivalent 1 lane u_bf16[i] space (u_c[0..3] are the registers in question). also each uint32_t has 2 BF16 values packed in it.
+
+                SM75_U32x1_MOVM_T::copy(u_c[0], u_b_regs[0]); // okay, so the reason we convert u_bf16 to uint32_t is because SM75_U32x1_MOVM_T takes source & destination argument as uint32_t dtypes
                 SM75_U32x1_MOVM_T::copy(u_c[1], u_b_regs[1]);
                 SM75_U32x1_MOVM_T::copy(u_c[2], u_b_regs[2]);
                 SM75_U32x1_MOVM_T::copy(u_c[3], u_b_regs[3]);
 
-                auto tCrB_u_tmp = thr_mma.partition_fragment_B(B_ref);
+                auto tCrB_u_tmp = thr_mma.partition_fragment_B(B_ref); // manually filing it into b_dst because other we'd have to move it back to SMEM & then using smem_tiled_copy_B load it back to registers using ldmatrix. Saves us a round trip. we do this also because u_b_regs are simply register arrays, & to put the values from these to an actual MMA frament which is why we are creating this.
                 uint32_t* b_dst = reinterpret_cast<uint32_t*>(&tCrB_u_tmp(0));
                 b_dst[0] = u_b_regs[0]; b_dst[1] = u_b_regs[1];
                 b_dst[2] = u_b_regs[2]; b_dst[3] = u_b_regs[3];
 
-                clear(u_acc[i]);
-                gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB_u_tmp(_,_,Int<0>{}), u_acc[i]);
+                clear(u_acc[i]); // prev u_acc[i] has 'k_decayed @ s_acc' output. we need a new one for 'INV @ u'
+                gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB_u_tmp(_,_,Int<0>{}), u_acc[i]); // gemm does 'u_acc[i] = INV @ u'
 
-                cute::transform(u_acc[i], u_bf16[i], [] __device__ (float x) { return BF16(x); });
+                cute::transform(u_acc[i], u_bf16[i], [] __device__ (float x) { return BF16(x); }); // BF16 again because Phase 4 & Phase 6 would need U again in BF16 B operand fragment.
             }
 
             // ======== Phase 4: Load Mqk, MOVM_T → tCrB_u_arr, Mqk@U + add out ========
-            copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(Mqk), tCrAi_k_view);
-            cute::transform(tCrAi_k, tCrA_k, cute::identity{});
+            // we have two vars here: u_bf16 & out_bf16, where
+            // u_bf16 = INV ((v - k_decayed @ s_acc) * beta)
+            // out_bf16 = q_decayed @ s_acc
+            // out = out + Mqk @ U
+            copy(smem_tiled_copy_A, smem_thr_copy_A.partition_S(Mqk), tCrAi_k_view); // being copied as an A operand is because Mqk @ U makes it A
+            cute::transform(tCrAi_k, tCrA_k, cute::identity{}); // views it as a ldmatrix tile & then moves it back to the actual A operand fragment.
 
             BFragT_u tCrB_u_arr[2];
 
             #pragma unroll
             for (int i = 0; i < 2; ++i) {
+                // making u_bf16 as a B operand fragment from being a C operand fragment.
                 uint32_t* u_c = reinterpret_cast<uint32_t*>(&u_bf16[i](0));
                 SM75_U32x1_MOVM_T::copy(u_c[0], u_b_regs[0]);
                 SM75_U32x1_MOVM_T::copy(u_c[1], u_b_regs[1]);
@@ -637,8 +728,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 b_dst[0] = u_b_regs[0]; b_dst[1] = u_b_regs[1];
                 b_dst[2] = u_b_regs[2]; b_dst[3] = u_b_regs[3];
 
-                clear(out_acc[i]);
-                gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB_u_arr[i](_,_,Int<0>{}), out_acc[i]);
+                clear(out_acc[i]); // clear the Phase 1 value of out_acc
+                gemm(thr_mma, tCrA_k(_,_,Int<0>{}), tCrB_u_arr[i](_,_,Int<0>{}), out_acc[i]); // out_acc = Mqk @ U
 
                 SFragT gemm_bf16;
                 cute::transform(out_acc[i], gemm_bf16, [] __device__ (float x) { return BF16(x); });
@@ -649,38 +740,60 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             #pragma unroll
             for (int i = 0; i < 2; ++i) {
                 Tensor out_block = local_tile(out_tile, make_shape(Int<16>{}, Int<16>{}), make_coord(0, warp_id * 2 + i));
-                copy(smem_tiled_store_C, smem_thr_store_C.retile_S(out_bf16[i]), smem_thr_store_C.partition_D(out_block));
+                copy(smem_tiled_store_C, smem_thr_store_C.retile_S(out_bf16[i]), smem_thr_store_C.partition_D(out_block)); // this uses stmatrix to store from registers to smem. from out_bf16 register fragment -> smem out_block. also we use retile_S, when we already know what lane register fragments are & for partition_D, when we already know a full tile and want to make it into per-lane register writes.
             }
 
             // ======== Phase 6: s_acc update ========
             // s_acc[D, D] = s_acc * g_total + k_restored_t[D, 16] @ U[16, D]
             // Each warp handles columns [warp_id*32, (warp_id+1)*32] = 2 x 16x16 blocks
             // U is already in tCrB_u_arr[0..1] as B operands (from Phase 4 MOVM_T)
-            constexpr int S_M_BLOCKS = decltype(cute::size<0>(k_restored_t))::value / 16;
+            constexpr int S_M_BLOCKS = decltype(cute::size<0>(k_restored_t))::value / 16; // k_restored_t shape is [128, 16]which means size<0> gives us 128 / 16 = 8 row blocks of state.
 
             Tensor tCrAi_kr = make_fragment_like<BF16>(thr_mma.partition_fragment_A(A_ref));
             auto tCrAi_kr_view = smem_thr_copy_A_T.retile_D(tCrAi_kr);
 
-            AFragT ring_A_kr[PREFETCH];
-            SFragT ring_S_acc[2][PREFETCH];
-            float ring_g0[PREFETCH], ring_g1[PREFETCH];
+            AFragT ring_A_kr[PREFETCH]; // PREFETCH = 1 is just one-slot buffering. also ring_A_kr loads 'k_restored_t' A fragment for current row block
+            SFragT ring_S_acc[2][PREFETCH]; // two col state blocks per warp.
+            float ring_g0[PREFETCH], ring_g1[PREFETCH]; // g_total values for two row groups in this lane's fragment.
 
             #pragma unroll
             for (int i = 0; i < PREFETCH; ++i) {
                 Tensor kr_block = local_tile(k_restored_t, make_shape(Int<16>{}, Int<16>{}), make_coord(i, 0));
                 copy(smem_tiled_copy_A_T, smem_thr_copy_A_T.partition_S(kr_block), tCrAi_kr_view);
-                cute::transform(tCrAi_kr, ring_A_kr[i], cute::identity{});
+                cute::transform(tCrAi_kr, ring_A_kr[i], cute::identity{}); // this whole copy & transform b/w tCrAi_kr_view & tCrAi_kr & ring_A_kr can be skipped just like the s_block one below.
 
                 #pragma unroll
-                for (int bi = 0; bi < 2; ++bi) {
+                for (int bi = 0; bi < 2; ++bi) { // bi is two column blocks in each warp
                     Tensor s_block = local_tile(s_acc_T, make_shape(Int<16>{}, Int<16>{}), make_coord(i, warp_id * 2 + bi));
                     copy(smem_tiled_load_C_T, smem_thr_load_C_T.partition_S(s_block), smem_thr_load_C_T.retile_D(ring_S_acc[bi][i]));
                 }
 
-                ring_g0[i] = g_total(i * 16 + group_id);
+                ring_g0[i] = g_total(i * 16 + group_id); // so the reason this is 'i * 16', is only because state is in tiles of 16x16. the '+ 8' is mostly for group to handle two row positions 0..7 & 8..15
                 ring_g1[i] = g_total(i * 16 + group_id + 8);
             }
 
+            /*
+              So one row-block iteration has this rhythm:
+
+              Use current A and current old state:
+                u_acc[bi] = A_current @ U[bi]
+
+              Overwrite A/g ring with next row block:
+                ring_A_kr[slot] = A_next
+                ring_g0/g1[slot] = g_next
+
+              Update current old state:
+                ring_S_acc[bi][slot] = old_state_current * g_current + u_acc[bi]
+
+              Store current updated state:
+                s_acc[current row, current col] = ring_S_acc[bi][slot]
+
+              Overwrite state ring with next old state:
+                ring_S_acc[bi][slot] = old_state_next
+
+              After the m loop finishes, every warp has updated all row blocks for its two
+              column blocks. Then:
+            */
             #pragma unroll
             for (int m = 0; m < S_M_BLOCKS; ++m) {
                 const int slot = m % PREFETCH;
@@ -691,7 +804,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 #pragma unroll
                 for (int bi = 0; bi < 2; ++bi) {
                     clear(u_acc[bi]);
-                    gemm(thr_mma, ring_A_kr[slot](_,_,Int<0>{}), tCrB_u_arr[bi](_,_,Int<0>{}), u_acc[bi]);
+                    // See docs/fwd-kernel2-phase6-state-update-tiling.md for the slot-vs-bi tiling map.
+                    gemm(thr_mma, ring_A_kr[slot](_,_,Int<0>{}), tCrB_u_arr[bi](_,_,Int<0>{}), u_acc[bi]); // computing u_acc[bi] = k_restored_t_block @ U_block
                 }
 
                 if (m + PREFETCH < S_M_BLOCKS) {
@@ -699,7 +813,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                     copy(smem_tiled_copy_A_T, smem_thr_copy_A_T.partition_S(kr_next), tCrAi_kr_view);
                     cute::transform(tCrAi_kr, ring_A_kr[slot], cute::identity{});
 
-                    ring_g0[slot] = g_total((m + PREFETCH) * 16 + group_id);
+                    ring_g0[slot] = g_total((m + PREFETCH) * 16 + group_id); // pre-fetching the next g_total tiles is totally okay here because g0, g1 already have prev. values.
                     ring_g1[slot] = g_total((m + PREFETCH) * 16 + group_id + 8);
                 }
 
@@ -709,6 +823,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                     for (int a = 0; a < 2; ++a) {
                         #pragma unroll
                         for (int d = 0; d < 2; ++d) {
+                            // basically what is happening here is "new_state = old_state * g_total + update"
+                            // c0 & c1 are two sets of C-fragment coordinates owned by this lane (mainly two row groups inside 16x16 tile).
+                            // each lane updates 8 BF16 C-fragment elements 
                             auto c0 = make_coord(make_coord(a, 0), 0, d);
                             auto c1 = make_coord(make_coord(a, 1), 0, d);
                             ring_S_acc[bi][slot](c0) = BF16(bf16_to_f32(ring_S_acc[bi][slot](c0)) * g0 + u_acc[bi](c0));
@@ -716,9 +833,11 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                         }
                     }
 
+                    // storing the current updated 16x16 tile back to shared-memory.
                     Tensor s_block = local_tile(s_acc_T, make_shape(Int<16>{}, Int<16>{}), make_coord(m, warp_id * 2 + bi));
                     copy(smem_tiled_store_C_T, smem_thr_store_C_T.retile_S(ring_S_acc[bi][slot]), smem_thr_store_C_T.partition_D(s_block));
 
+                    // loading next row block's old state tile into 'ring_S_acc' buffer
                     if (m + PREFETCH < S_M_BLOCKS) {
                         Tensor s_next = local_tile(s_acc_T, make_shape(Int<16>{}, Int<16>{}), make_coord(m + PREFETCH, warp_id * 2 + bi));
                         copy(smem_tiled_load_C_T, smem_thr_load_C_T.partition_S(s_next), smem_thr_load_C_T.retile_D(ring_S_acc[bi][slot]));
@@ -729,6 +848,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             compute_barrier.arrive_and_wait();
 
 #ifndef TMA_DISABLE_ALL
+            // See docs/fwd-kernel2-pipeline-handoff.md for the load/store pipeline ownership protocol.
             cutlass::arch::fence_view_async_shared();
             store_pipeline.producer_commit(out_write);
             load_pipeline.consumer_release(load_read);
@@ -781,6 +901,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
         if constexpr (HasStateOut && !StateFP32) {
             // BF16 state: TMA store directly from state_acc
+            // See docs/fwd-kernel2-final-state-tma-shapes.md for the [N,H,D,D] -> [N*H,D,D] TMA tile mapping.
             Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
             auto state_off = g_final.layout()(seq_idx * H + head_idx, 0, 0);
             Tensor g_final_tile = make_tensor(g_final.data() + state_off,
