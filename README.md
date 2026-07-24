@@ -1,13 +1,13 @@
-# FlashKDA++
+# Flash-Flash KDA
 
-FlashKDA++ is an H100-focused optimization of
+Flash-Flash KDA is an H100-focused optimization of
 [MoonshotAI/FlashKDA](https://github.com/MoonshotAI/FlashKDA), a CUTLASS
 implementation of Flash Kimi Delta Attention. It keeps the `flash_kda`
 package and forward API compatible while reducing complete-call latency
 relative to the original FlashKDA source.
 
-The project name is **FlashKDA++**; the GitHub slug is
-`FlashKDA-PlusPlus` because GitHub does not permit `+` in repository names.
+The project name is **Flash-Flash KDA**; the GitHub slug is
+`Flash-Flash-KDA` because GitHub repository names cannot contain spaces.
 
 ## What changed
 
@@ -32,7 +32,7 @@ external FP32 initial/final state, not an isolated kernel phase. The table
 below uses `T=8192`, `D=128`, an H100 80 GB, 30 warmups, 200 timed calls per
 repeat, five repeats, and the arithmetic mean of all 1,000 samples.
 
-| H96 workload | Original FlashKDA | FlashKDA++ | Speedup | Latency reduction |
+| H96 workload | Original FlashKDA | Flash-Flash KDA | Speedup | Latency reduction |
 |---|---:|---:|---:|---:|
 | Fixed `[8192]` | 1.5153 ms | 1.0628 ms | **1.43x** | 29.9% |
 | Uneven packed `[1300, 547, 2048, 963, 271, 3063]` | 1.5644 ms | 0.9331 ms | **1.68x** | 40.4% |
@@ -56,7 +56,7 @@ The claims use different denominators:
 - Upstream measures `FLA chunk_kda / stock FlashKDA` on H20. The checked-in
   [H20 report](BENCHMARK_H20.md) ranges from 1.85x to 2.31x against that FLA
   path.
-- This repository measures `stock FlashKDA / FlashKDA++` on H100 and obtains
+- This repository measures `stock FlashKDA / Flash-Flash KDA` on H100 and obtains
   1.43x to 1.68x for the current optimized source.
 
 The hardware, baseline implementation, and source revisions differ, so the
@@ -75,8 +75,8 @@ performance results above are H100-only.
 
 ```bash
 git clone --recurse-submodules \
-  https://github.com/Itssshikhar/FlashKDA-PlusPlus.git
-cd FlashKDA-PlusPlus
+  https://github.com/Itssshikhar/Flash-Flash-KDA.git
+cd Flash-Flash-KDA
 pip install -v --no-build-isolation .
 ```
 
@@ -185,7 +185,7 @@ Run the repository test suite:
 bash tests/test.sh
 ```
 
-Benchmark only FlashKDA++ across the three H100 workload shapes:
+Benchmark only Flash-Flash KDA across the three H100 workload shapes:
 
 ```bash
 python benchmarks/bench_fwd.py \

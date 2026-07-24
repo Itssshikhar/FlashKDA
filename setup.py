@@ -92,7 +92,7 @@ if not rev:
 setup(
     name='flash_kda',
     version='0.0.1' + rev,
-    description='FlashKDA++: optimized Flash Kimi Delta Attention',
+    description='Flash-Flash KDA: optimized Flash Kimi Delta Attention',
     ext_modules=ext_modules,
     packages=['flash_kda'],
     cmdclass=cmdclass,

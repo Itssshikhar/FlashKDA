@@ -1,6 +1,6 @@
 # H100 optimization results
 
-This note records the performance claim for FlashKDA++, how it differs from
+This note records the performance claim for Flash-Flash KDA, how it differs from
 the upstream FlashKDA-versus-FLA claim, and the evidence used to accept the
 optimized source.
 
@@ -11,7 +11,7 @@ The primary comparison is:
 ```text
 original FlashKDA full-call latency
 -----------------------------------
-FlashKDA++ full-call latency
+Flash-Flash KDA full-call latency
 ```
 
 Both sides measure the complete `flash_kda.fwd` call with external FP32
@@ -142,13 +142,13 @@ For example, `BENCHMARK_H20.md` reports 1.85-2.31x against FLA `chunk_kda`.
 The report generator times random inputs but performs no numerical comparison
 inside the timing command; the repository's correctness tests are separate.
 
-FlashKDA++ instead reports 1.43-1.68x for the current source against stock
+Flash-Flash KDA instead reports 1.43-1.68x for the current source against stock
 FlashKDA on H100. Different hardware, revisions, and denominators make it
 invalid to multiply the two ratios.
 
 ## Reproduction
 
-After building FlashKDA++ on a supported CUDA device:
+After building Flash-Flash KDA on a supported CUDA device:
 
 ```bash
 python tests/check_optimized_fwd.py
