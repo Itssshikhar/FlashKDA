@@ -1,8 +1,26 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+from flash_kda_C import (
+    fwd as _fwd_raw,
+    get_workspace_size,
+)
 
 
-def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
+def fwd(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    scale,
+    out,
+    A_log,
+    dt_bias,
+    lower_bound,
+    initial_state=None,
+    final_state=None,
+    cu_seqlens=None,
+    uniform_seq_len=None,
+):
     """FlashKDA forward (Flash Kimi Delta Attention).
 
     Args:
@@ -25,6 +43,10 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
             recurrent state. Same dtype/shape rules as ``initial_state``.
         cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths, int64,
             shape ``[N+1]``. When provided, ``B`` must be 1.
+        uniform_seq_len (int, optional): Assert that every sequence represented
+            by ``cu_seqlens`` has this length. This enables the exact packed-
+            uniform launch path without synchronizing to inspect
+            ``cu_seqlens`` on the host.
 
     Notes:
         * Currently requires ``K = V = 128``.
@@ -35,7 +57,13 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
     T_total = B * T_seq
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
 
-    workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
+    uniform_seq_len = 0 if uniform_seq_len is None else int(uniform_seq_len)
+    workspace = torch.empty(
+        get_workspace_size(T_total, H, N, uniform_seq_len),
+        dtype=torch.uint8,
+        device=q.device,
+    )
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
-             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens,
+             uniform_seq_len=uniform_seq_len)

@@ -41,7 +41,7 @@ sigmoid_ext = load_inline(
 # ============================================================
 # cuBLAS fp16 accumulation GEMM
 # ============================================================
-_cublas = ctypes.CDLL('libcublas.so')
+_cublas = ctypes.CDLL('libcublas.so.12')
 _cublas_handle = ctypes.c_void_p()
 assert _cublas.cublasCreate_v2(ctypes.byref(_cublas_handle)) == 0
 

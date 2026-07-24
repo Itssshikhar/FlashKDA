@@ -7,14 +7,9 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 subprocess.run(["git", "submodule", "update", "--init", "cutlass"])
 
 
-def is_flag_set(flag: str) -> bool:
-    return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
-
-
 def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
-
 
 SUPPORTED_CUDA_ARCHS = ["90a", "100a", "103a", "120a"]
 
@@ -97,7 +92,7 @@ if not rev:
 setup(
     name='flash_kda',
     version='0.0.1' + rev,
-    description='FlashKDA: Flash Kimi Delta Attention',
+    description='FlashKDA++: optimized Flash Kimi Delta Attention',
     ext_modules=ext_modules,
     packages=['flash_kda'],
     cmdclass=cmdclass,

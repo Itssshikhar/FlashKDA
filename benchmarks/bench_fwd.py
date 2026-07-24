@@ -2,8 +2,6 @@ import torch
 import flash_kda
 import torch.nn.functional as F
 import math
-from fla.ops.kda import chunk_kda
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
 def bench_fn(fn, warmup, iters, repeats):
     for _ in range(max(warmup, 1)):
@@ -30,7 +28,7 @@ def bench_fn(fn, warmup, iters, repeats):
     return mean, mn, mx
 
 
-def run_case(seq_lens, H, D, warmup, iters, repeats):
+def run_case(seq_lens, H, D, warmup, iters, repeats, flash_only=False):
     device = torch.device("cuda")
     LOWER_BOUND = -5.0
     scale_float = 1.0 / math.sqrt(D)
@@ -45,10 +43,14 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             dtype=torch.long, device=device,
         )
         print(f"varlen shape=[{T_total},{H},{D}] seq_lens={seq_lens} warmup={warmup} iters={iters} repeats={repeats}")
-        extra = {"cu_seqlens": cu_seqlens}
+        fla_extra = {"cu_seqlens": cu_seqlens}
+        flash_extra = dict(fla_extra)
+        if all(seq_len == seq_lens[0] for seq_len in seq_lens):
+            flash_extra["uniform_seq_len"] = seq_lens[0]
     else:
         print(f"shape=[{T_total},{H},{D}] warmup={warmup} iters={iters} repeats={repeats}")
-        extra = {}
+        fla_extra = {}
+        flash_extra = {}
 
     q = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device=device), p=2, dim=-1).to(torch.bfloat16)
     k = F.normalize(torch.randn((1, T_total, H, D), dtype=torch.float32, device=device), p=2, dim=-1).to(torch.bfloat16)
@@ -67,7 +69,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     def run_flash_kda():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
                       A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                      initial_state=initial_state, final_state=final_state, **extra)
+                      initial_state=initial_state, final_state=final_state, **flash_extra)
 
     mean, mn, mx = bench_fn(run_flash_kda, warmup, iters, repeats)
     print(f"  flash_kda (bf16 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -75,7 +77,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     # --- flash_kda: no state ---
     def run_flash_kda_no_state():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
-                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND, **extra)
+                      A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND, **flash_extra)
 
     mean, mn, mx = bench_fn(run_flash_kda_no_state, warmup, iters, repeats)
     print(f"  flash_kda (no state)   : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
@@ -87,10 +89,16 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
     def run_flash_kda_fp32():
         flash_kda.fwd(q, k, v, g, beta, scale, out,
                       A_log=A_log, dt_bias=dt_bias, lower_bound=LOWER_BOUND,
-                      initial_state=initial_state_fp32, final_state=final_state_fp32, **extra)
+                      initial_state=initial_state_fp32, final_state=final_state_fp32, **flash_extra)
 
     mean, mn, mx = bench_fn(run_flash_kda_fp32, warmup, iters, repeats)
     print(f"  flash_kda (fp32 state) : mean={mean:.4f} ms, min={mn:.4f} ms, max={mx:.4f} ms")
+
+    if flash_only:
+        return
+
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.kda import chunk_kda
 
     # --- chunk_kda ---
     h0_ck = initial_state.float()
@@ -107,7 +115,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             A_log=A_log, dt_bias=dt_bias,
             lower_bound=LOWER_BOUND,
             transpose_state_layout=True,
-            **extra,
+            **fla_extra,
         )
 
     mean, mn, mx = bench_fn(run_chunk_kda, warmup, iters, repeats)
@@ -125,7 +133,7 @@ def run_case(seq_lens, H, D, warmup, iters, repeats):
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             transpose_state_layout=True,
-            **extra,
+            **fla_extra,
         )
 
     mean, mn, mx = bench_fn(run_chunk_gated_delta_rule, warmup, iters, repeats)
@@ -148,19 +156,34 @@ def main():
     p.add_argument("--warmup", type=int, default=30)
     p.add_argument("--iters", type=int, default=200)
     p.add_argument("--repeats", type=int, default=5)
-    p.add_argument("--mode", choices=["fixed", "varlen", "all"], default="all")
+    p.add_argument(
+        "--mode",
+        choices=["fixed", "uneven", "equal", "varlen", "all"],
+        default="all",
+    )
     p.add_argument("--H", type=int, default=96)
     p.add_argument("--D", type=int, default=128)
+    p.add_argument("--flash-only", action="store_true")
     args = p.parse_args()
 
     cases = []
     if args.mode in ("fixed", "all"):
         cases.extend(FIXED_CASES)
-    if args.mode in ("varlen", "all"):
-        cases.extend(VARLEN_CASES)
+    if args.mode in ("uneven", "varlen", "all"):
+        cases.append(VARLEN_CASES[0])
+    if args.mode in ("equal", "varlen", "all"):
+        cases.append(VARLEN_CASES[1])
 
     for seq_lens in cases:
-        run_case(seq_lens, args.H, args.D, args.warmup, args.iters, args.repeats)
+        run_case(
+            seq_lens,
+            args.H,
+            args.D,
+            args.warmup,
+            args.iters,
+            args.repeats,
+            flash_only=args.flash_only,
+        )
 
 
 if __name__ == "__main__":

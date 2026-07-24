@@ -1,10 +1,18 @@
-build/**
-.cache/**
-*.egg-info/**
+# Build and package outputs
+build/
+.cache/
+*.egg-info/
 *.so
+**/__pycache__/
+
+# Generated benchmark and profiler outputs
+artifacts/
+ncu_reports/
 *.ncu-rep
 *.nsys-rep
-.vscode/**
-**/__pycache__/**
+
+# Local tooling
+.vscode/
 .clangd
 plot*.png
+/a.out

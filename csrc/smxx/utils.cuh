@@ -27,14 +27,6 @@
 #include "cute/numeric/integral_constant.hpp"
 #include "cute/tensor_impl.hpp"
 
-#ifndef BLOCK_LEVEL_K1
-#define BLOCK_LEVEL_K1 1
-#endif
-
-#ifndef BLOCK_LEVEL_K2
-#define BLOCK_LEVEL_K2 1
-#endif
-
 __device__ __forceinline__ float ex2_approx_ftz_f32(float x) {
     float result;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
@@ -74,6 +66,18 @@ struct WorkspaceSizes {
     static constexpr int kINV       = CHUNK * CHUNK * 2;     // 512
     static constexpr int kMqk       = CHUNK * CHUNK * 2;     // 512
     static constexpr int64_t kPerTile = kKDecayed + kQDecayed + kKRestored + kGTotal + kINV + kMqk;
+};
+
+// Raw global-memory base pointers for the six K1→K2 workspace tensors.
+// Each per-tile slot is a byte image of K1's swizzled shared-memory tensor;
+// K2 restores the image into a byte-identical layout with a bulk copy.
+struct K1WorkspaceRawPointers {
+    cutlass::bfloat16_t* k_decayed = nullptr;
+    cutlass::bfloat16_t* q_decayed = nullptr;
+    cutlass::bfloat16_t* k_restored = nullptr;
+    float* g_total = nullptr;
+    cutlass::bfloat16_t* inv = nullptr;
+    cutlass::bfloat16_t* mqk = nullptr;
 };
 
 enum class WarpRole {
@@ -318,7 +322,7 @@ CUTLASS_DEVICE void neumann_inv_fused_1warp(
 //   - Each thread converts 2 elements
 //   - Warp-level iteration over all atoms in the D x D state
 
-template <class FP32Layout, class BF16Layout, int D, int NumThreads>
+template <class FP32Layout, class BF16Layout, int Rows, int Cols, int NumThreads>
 __device__ void smem_cvt_fp32_to_bf16(
     float* __restrict__ fp32_smem,
     cutlass::bfloat16_t* __restrict__ bf16_smem,
@@ -326,8 +330,10 @@ __device__ void smem_cvt_fp32_to_bf16(
 ) {
     using BF16 = cutlass::bfloat16_t;
     constexpr int kBlock = 8;
-    constexpr int kBlocksPerDim = D / kBlock;
-    constexpr int kTotalBlocks = kBlocksPerDim * kBlocksPerDim;
+    static_assert(Rows % kBlock == 0 && Cols % kBlock == 0);
+    constexpr int kRowBlocks = Rows / kBlock;
+    constexpr int kColBlocks = Cols / kBlock;
+    constexpr int kTotalBlocks = kRowBlocks * kColBlocks;
     constexpr int kWarpSize = 32;
 
     auto fp32_view = make_tensor(make_smem_ptr(fp32_smem), FP32Layout{});
@@ -338,8 +344,8 @@ __device__ void smem_cvt_fp32_to_bf16(
     int num_warps = NumThreads / kWarpSize;
 
     for (int blk = warp_id; blk < kTotalBlocks; blk += num_warps) {
-        int br = (blk / kBlocksPerDim) * kBlock;
-        int bc = (blk % kBlocksPerDim) * kBlock;
+        int br = (blk / kColBlocks) * kBlock;
+        int bc = (blk % kColBlocks) * kBlock;
         int e0 = lane_id * 2;
         int e1 = lane_id * 2 + 1;
         int r0 = br + e0 / kBlock, c0 = bc + e0 % kBlock;
@@ -349,15 +355,17 @@ __device__ void smem_cvt_fp32_to_bf16(
     }
 }
 
-template <class BF16Layout, class FP32Layout, int D, int NumThreads>
+template <class BF16Layout, class FP32Layout, int Rows, int Cols, int NumThreads>
 __device__ void smem_cvt_bf16_to_fp32(
     cutlass::bfloat16_t* __restrict__ bf16_smem,
     float* __restrict__ fp32_smem,
     int tid
 ) {
     constexpr int kBlock = 8;
-    constexpr int kBlocksPerDim = D / kBlock;
-    constexpr int kTotalBlocks = kBlocksPerDim * kBlocksPerDim;
+    static_assert(Rows % kBlock == 0 && Cols % kBlock == 0);
+    constexpr int kRowBlocks = Rows / kBlock;
+    constexpr int kColBlocks = Cols / kBlock;
+    constexpr int kTotalBlocks = kRowBlocks * kColBlocks;
     constexpr int kWarpSize = 32;
 
     auto bf16_view = make_tensor(make_smem_ptr(bf16_smem), BF16Layout{});
@@ -368,8 +376,8 @@ __device__ void smem_cvt_bf16_to_fp32(
     int num_warps = NumThreads / kWarpSize;
 
     for (int blk = warp_id; blk < kTotalBlocks; blk += num_warps) {
-        int br = (blk / kBlocksPerDim) * kBlock;
-        int bc = (blk % kBlocksPerDim) * kBlock;
+        int br = (blk / kColBlocks) * kBlock;
+        int bc = (blk % kColBlocks) * kBlock;
         int e0 = lane_id * 2;
         int e1 = lane_id * 2 + 1;
         int r0 = br + e0 / kBlock, c0 = bc + e0 % kBlock;
@@ -378,4 +386,3 @@ __device__ void smem_cvt_bf16_to_fp32(
         fp32_view(r1, c1) = bf16_to_f32(bf16_view(r1, c1));
     }
 }
-

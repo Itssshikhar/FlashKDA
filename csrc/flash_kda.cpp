@@ -5,13 +5,25 @@
 int64_t get_workspace_size(
     int64_t T_total,
     int64_t H,
-    int64_t N = 1
+    int64_t N = 1,
+    int64_t uniform_seq_len = 0
 ) {
     constexpr int CHUNK = 16;
     constexpr int D = 128;
 
-    // Upper bound: each of N sequences adds at most 1 extra tile vs floor division
-    int64_t total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+    TORCH_CHECK(T_total >= 0 && H > 0 && N > 0,
+                "T_total must be non-negative and H/N must be positive");
+    TORCH_CHECK(uniform_seq_len >= 0, "uniform_seq_len must be non-negative");
+
+    int64_t total_tiles;
+    if (uniform_seq_len > 0) {
+        TORCH_CHECK(T_total == N * uniform_seq_len,
+                    "T_total must equal N * uniform_seq_len");
+        total_tiles = N * ((uniform_seq_len + CHUNK - 1) / CHUNK);
+    } else {
+        // Upper bound: each sequence adds at most one tile vs floor division.
+        total_tiles = (T_total + CHUNK - 1) / CHUNK + N;
+    }
 
     static_assert(CHUNK * D * 2 % 128 == 0, "k_decayed/q_decayed/k_restored size must be 128-byte aligned");
     static_assert(D * 4 % 128 == 0, "g_total size must be 128-byte aligned");
@@ -36,7 +48,8 @@ void fwd(
     double lower_bound,
     std::optional<torch::Tensor> initial_state = std::nullopt,
     std::optional<torch::Tensor> final_state = std::nullopt,
-    std::optional<torch::Tensor> cu_seqlens = std::nullopt
+    std::optional<torch::Tensor> cu_seqlens = std::nullopt,
+    int64_t uniform_seq_len = 0
 ) {
     TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                 "all tensors must be on CUDA");
@@ -147,6 +160,7 @@ void fwd(
         TORCH_CHECK(B == 1, "B must be 1 when cu_seqlens is provided");
         auto& cu_seqlens_t = cu_seqlens.value();
         TORCH_CHECK(cu_seqlens_t.is_cuda(), "cu_seqlens must be on CUDA");
+        TORCH_CHECK(cu_seqlens_t.is_contiguous(), "cu_seqlens must be contiguous");
         TORCH_CHECK(cu_seqlens_t.dtype() == torch::kLong, "cu_seqlens must be int64");
         TORCH_CHECK(cu_seqlens_t.dim() == 1, "cu_seqlens must be 1D");
         N_val = cu_seqlens_t.numel() - 1;
@@ -154,6 +168,15 @@ void fwd(
         cu_seqlens_dev = cu_seqlens_t.data_ptr<int64_t>();
     } else {
         N_val = B;
+    }
+
+    TORCH_CHECK(uniform_seq_len >= 0, "uniform_seq_len must be non-negative");
+    bool is_uniform_packed = is_varlen && uniform_seq_len > 0;
+    if (uniform_seq_len > 0) {
+        TORCH_CHECK(is_varlen,
+                    "uniform_seq_len is only valid together with cu_seqlens");
+        TORCH_CHECK(T_total == N_val * uniform_seq_len,
+                    "packed input length must equal N * uniform_seq_len");
     }
 
     // Validate state shapes: always [N, H, D, D]
@@ -171,7 +194,9 @@ void fwd(
     }
 
     int total_tiles;
-    if (is_varlen) {
+    if (is_uniform_packed) {
+        total_tiles = int(N_val * ((uniform_seq_len + CHUNK - 1) / CHUNK));
+    } else if (is_varlen) {
         total_tiles = int((T_total + CHUNK - 1) / CHUNK + N_val);  // upper bound for varlen
     } else {
         total_tiles = int(N_val * ((T_seq + CHUNK - 1) / CHUNK));   // exact for batched
@@ -203,7 +228,7 @@ void fwd(
             LAUNCH(true, false, false, VL); \
         }
 
-    if (is_varlen) {
+    if (is_varlen && !is_uniform_packed) {
         DISPATCH_STATE(true);
     } else {
         DISPATCH_STATE(false);
@@ -220,10 +245,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("workspace"),
         py::arg("A_log"), py::arg("dt_bias"), py::arg("lower_bound"),
         py::arg("initial_state") = py::none(), py::arg("final_state") = py::none(),
-        py::arg("cu_seqlens") = py::none());
+        py::arg("cu_seqlens") = py::none(),
+        py::arg("uniform_seq_len") = 0);
     m.def("get_workspace_size",
-        static_cast<int64_t(*)(int64_t, int64_t, int64_t)>(&get_workspace_size),
+        static_cast<int64_t(*)(int64_t, int64_t, int64_t, int64_t)>(&get_workspace_size),
         "Get workspace size in bytes",
         py::arg("T_total"), py::arg("H"),
-        py::arg("N") = 1);
+        py::arg("N") = 1, py::arg("uniform_seq_len") = 0);
 }

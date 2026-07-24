@@ -29,20 +29,20 @@ void launch_fwd(
     constexpr int kInputStages = 3;
     constexpr int kOutputStages = 2;
     constexpr int CHUNK = 16;
+    constexpr int kK2Columns = D;
 
     using K1L = K1Layouts<D, CHUNK>;
-    using K2L = K2Layouts<D, CHUNK>;
+    using K2L = K2Layouts<D, CHUNK, kK2Columns>;
     using WS = WorkspaceSizes<CHUNK, D>;
 
     // TMA layouts for Kernel 1
     using TMAQKLayout = typename K1L::TMAQKLayout;
-    using TMAGLayout = typename K1L::TMAGLayout;
     using TMABetaSmemLayout = typename K1L::TMABetaSmemLayout;
-    using TMAVOLayout = typename K1L::TMAVOLayout;
-    using TMALMLayout = typename K1L::TMALMLayout;
     using TMAGTotalSmemLayout = typename K1L::TMAGTotalSmemLayout;
 
     // TMA layouts for Kernel 2
+    using K2TMAVOLayout = typename K2L::TMAVOLayout;
+    using K2TMAOutLayout = typename K2L::TMAOutLayout;
     using TMAStateSmemLayout = typename K2L::TMAStateSmemLayout;
     using TMAFP32StateSmemLayout = typename K2L::TMAFP32StateSmemLayout;
 
@@ -68,20 +68,7 @@ void launch_fwd(
     BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
     BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
 
-    auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
-    auto ws_qd_gmem_layout = ws_kd_gmem_layout;
-    auto ws_kr_gmem_layout = ws_kd_gmem_layout;
-    auto ws_gt_gmem_layout = make_layout(make_shape(int(n_ht), D), LayoutRight{});
-    auto ws_lm_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, CHUNK), LayoutRight{});
-
-    Tensor m_ws_kd  = make_tensor(make_gmem_ptr(ws_kd), ws_kd_gmem_layout);
-    Tensor m_ws_qd  = make_tensor(make_gmem_ptr(ws_qd), ws_qd_gmem_layout);
-    Tensor m_ws_kr  = make_tensor(make_gmem_ptr(ws_kr), ws_kr_gmem_layout);
-    Tensor m_ws_gt  = make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
-    Tensor m_ws_inv = make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
-    Tensor m_ws_mqk = make_tensor(make_gmem_ptr(ws_mqk), ws_lm_gmem_layout);
-
-    // --- TMA descriptors for Kernel 1 (loads: q,k,beta; stores: workspace)
+    // --- TMA descriptors for Kernel 1 inputs
     auto tma_load_q    = make_tma_copy(SM90_TMA_LOAD{}, m_q, TMAQKLayout{});
     auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
     auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
@@ -93,25 +80,11 @@ void launch_fwd(
     Tensor m_dt_bias = make_tensor(make_gmem_ptr(dt_bias_ptr), dt_bias_gmem_layout);
     auto tma_load_dt_bias = make_tma_copy(SM90_TMA_LOAD{}, m_dt_bias, TMAGTotalSmemLayout{});
 
-    auto tma_store_ws_kd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kd, TMAVOLayout{});
-    auto tma_store_ws_qd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_qd, TMAVOLayout{});
-    auto tma_store_ws_kr  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kr, TMAVOLayout{});
-    auto tma_store_ws_gt  = make_tma_copy(SM90_TMA_STORE{}, m_ws_gt, TMAGTotalSmemLayout{});
-    auto tma_store_ws_inv = make_tma_copy(SM90_TMA_STORE{}, m_ws_inv, TMALMLayout{});
-    auto tma_store_ws_mqk = make_tma_copy(SM90_TMA_STORE{}, m_ws_mqk, TMALMLayout{});
-
-    // --- TMA descriptors for Kernel 2 (loads: v,beta,workspace; load/store: state,out)
-    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
+    // --- TMA descriptors for Kernel 2 inputs and outputs. Workspace payloads
+    // use the raw bulk-copy pointers above rather than tensor maps.
+    auto tma_load_v = make_tma_copy(SM90_TMA_LOAD{}, m_v, K2TMAVOLayout{});
     auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
-
-    auto tma_load_ws_kd  = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kd, TMAVOLayout{});
-    auto tma_load_ws_qd  = make_tma_copy(SM90_TMA_LOAD{}, m_ws_qd, TMAVOLayout{});
-    auto tma_load_ws_kr  = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kr, TMAVOLayout{});
-    auto tma_load_ws_gt  = make_tma_copy(SM90_TMA_LOAD{}, m_ws_gt, TMAGTotalSmemLayout{});
-    auto tma_load_ws_inv = make_tma_copy(SM90_TMA_LOAD{}, m_ws_inv, TMALMLayout{});
-    auto tma_load_ws_mqk = make_tma_copy(SM90_TMA_LOAD{}, m_ws_mqk, TMALMLayout{});
-
-    auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
+    auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, K2TMAOutLayout{});
 
     // --- State TMA descriptors (conditional on HasStateIn/HasStateOut and StateFP32)
     auto make_state_tma = [&]() {
@@ -141,10 +114,10 @@ void launch_fwd(
     };
     auto [tma_load_initial_state, tma_store_final_state] = make_state_tma();
 
+
     // ===== Launch Kernel 1 (prepare) =====
-#if BLOCK_LEVEL_K1 >= 0
     {
-        constexpr int kK1Threads = 256;
+        constexpr int kK1Threads = 128;
         using SharedStorageK1T = SharedStorageK1<K1L>;
         int smem_size_k1 = sizeof(SharedStorageK1T);
 
@@ -152,8 +125,6 @@ void launch_fwd(
             decltype(tma_load_q), decltype(tma_load_k),
             decltype(tma_load_beta),
             decltype(tma_load_g), decltype(tma_load_dt_bias),
-            decltype(tma_store_ws_kd), decltype(tma_store_ws_qd), decltype(tma_store_ws_kr),
-            decltype(tma_store_ws_gt), decltype(tma_store_ws_inv), decltype(tma_store_ws_mqk),
             CHUNK, D, kK1Threads, IsVarlen
         >;
 
@@ -162,51 +133,51 @@ void launch_fwd(
         dim3 grid_k1(total_tiles, H);
         dim3 block_k1(kK1Threads);
 
+        K1WorkspaceRawPointers ws_raw{ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk};
         kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
             tma_load_q, tma_load_k, tma_load_beta,
             tma_load_g, tma_load_dt_bias,
-            tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
-            tma_store_ws_gt, tma_store_ws_inv, tma_store_ws_mqk,
             scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
-            A_log_ptr, gate_scale
+            A_log_ptr, gate_scale, ws_raw
         );
     }
-#endif
 
     // ===== Launch Kernel 2 (recurrence) =====
-#if BLOCK_LEVEL_K2 >= 0
     {
-        constexpr int kK2Threads = 32 * 2 + 128;
+        constexpr int kK2ComputeThreads = kK2Columns;
+        constexpr int kK2Threads = 32 * 2 + kK2ComputeThreads;
         using SharedStorageK2T = SharedStorageK2<K2L, kInputStages, kOutputStages>;
         int smem_size_k2 = sizeof(SharedStorageK2T);
 
         auto kernel2 = _flash_kda_fwd_recurrence<
             decltype(tma_load_v), decltype(tma_load_beta2),
-            decltype(tma_load_ws_kd), decltype(tma_load_ws_qd), decltype(tma_load_ws_kr),
-            decltype(tma_load_ws_gt), decltype(tma_load_ws_inv), decltype(tma_load_ws_mqk),
             decltype(tma_load_initial_state),
             decltype(tma_store_final_state),
             decltype(tma_store_out),
-            CHUNK, D, kInputStages, kOutputStages, kK2Threads,
+            CHUNK, D, kK2Columns, kInputStages, kOutputStages, kK2Threads,
             HasStateIn, HasStateOut, StateFP32, IsVarlen
         >;
 
         cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2);
 
-        dim3 grid_k2(N, H);
+        dim3 grid_k2;
+        if constexpr (IsVarlen) {
+            // With small varlen batches, x-major launch order issues all heads
+            // for each descending sequence-length rank together.
+            grid_k2 = N <= 32 ? dim3(H, N) : dim3(N, H);
+        } else {
+            grid_k2 = dim3(N, H);
+        }
         dim3 block_k2(kK2Threads);
 
+        K1WorkspaceRawPointers ws_raw{ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk};
         kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(
             tma_load_v, tma_load_beta2,
-            tma_load_ws_kd, tma_load_ws_qd, tma_load_ws_kr,
-            tma_load_ws_gt, tma_load_ws_inv, tma_load_ws_mqk,
-            tma_load_initial_state,
-            tma_store_final_state,
-            tma_store_out,
-            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
+            tma_load_initial_state, tma_store_final_state, tma_store_out,
+            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles,
+            ws_raw
         );
     }
-#endif
 }
 
 // Explicit instantiations
@@ -216,7 +187,8 @@ void launch_fwd(
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
         cutlass::bfloat16_t*, void*, int, int, int, int, \
-        int64_t const*, float const*, float const*, float, cudaStream_t);
+        int64_t const*, float const*, float const*, float, \
+        cudaStream_t);
 
 #define INSTANTIATE_STATE_VARIANTS(VL) \
     INSTANTIATE_LAUNCH_FWD(128, true,  true,  false, VL) \

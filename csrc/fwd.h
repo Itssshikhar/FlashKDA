@@ -1,6 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include <cutlass/bfloat16.h>
 
 template <int D, bool HasStateIn = true, bool HasStateOut = true, bool StateFP32 = false, bool IsVarlen = true>
